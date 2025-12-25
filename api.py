@@ -1,23 +1,25 @@
 import json
+import math
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ───────── LOAD DATA ─────────
+# ───────────────── LOAD DATABASE ─────────────────
 with open("movie.json", "r", encoding="utf-8") as f:
     MOVIES = json.load(f)
 
 TOTAL_MOVIES = len(MOVIES)
 
-# Build UID index for fast lookup
+# UID → item lookup (fast O(1))
 UID_INDEX = {item["uid"]: item for item in MOVIES}
 
-# ───────── HELPERS ─────────
+# ───────────────── HELPERS ─────────────────
 def normalize(text):
-    return text.lower()
+    return (text or "").lower()
 
-# ───────── ROUTES ─────────
+# ───────────────── ROUTES ─────────────────
 
+# 1️⃣ Health / Status
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
@@ -27,10 +29,19 @@ def health():
         "total_movies": TOTAL_MOVIES
     })
 
+
+# 2️⃣ Search Endpoint (Paginated)
 @app.route("/search", methods=["GET"])
 def search():
     query = request.args.get("q", "").strip()
+    page = int(request.args.get("page", 1))
     limit = int(request.args.get("limit", 10))
+
+    # Safety limits
+    if limit < 1:
+        limit = 10
+    if limit > 20:
+        limit = 20
 
     if not query:
         return jsonify({
@@ -39,14 +50,15 @@ def search():
         }), 400
 
     q = normalize(query)
-    results = []
+    matched = []
 
+    # Full DB scan (safe for ~20k items)
     for item in MOVIES:
-        title = normalize(item.get("title", ""))
-        fname = normalize(item.get("file_name", ""))
+        title = normalize(item.get("title"))
+        fname = normalize(item.get("file_name"))
 
         if q in title or q in fname:
-            results.append({
+            matched.append({
                 "uid": item["uid"],
                 "title": item.get("title"),
                 "size": item.get("size"),
@@ -54,15 +66,31 @@ def search():
                 "type": item.get("type")
             })
 
-        if len(results) >= limit:
-            break
+    total_results = len(matched)
+    total_pages = max(1, math.ceil(total_results / limit))
+
+    # Clamp page
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+
+    start = (page - 1) * limit
+    end = start + limit
+    page_results = matched[start:end]
 
     return jsonify({
         "success": True,
-        "count": len(results),
-        "results": results
+        "query": query,
+        "page": page,
+        "limit": limit,
+        "total_results": total_results,
+        "total_pages": total_pages,
+        "results": page_results
     })
 
+
+# 3️⃣ UID → File Resolver
 @app.route("/file", methods=["GET"])
 def file_lookup():
     uid = request.args.get("uid", "").strip()
