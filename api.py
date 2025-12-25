@@ -1,6 +1,5 @@
 import json
 from flask import Flask, request, jsonify
-import math
 
 app = Flask(__name__)
 
@@ -10,12 +9,12 @@ with open("movie.json", "r", encoding="utf-8") as f:
 
 TOTAL_MOVIES = len(MOVIES)
 
-# Build UID index (O(1) lookup)
+# Build UID index for fast lookup
 UID_INDEX = {item["uid"]: item for item in MOVIES}
 
 # ───────── HELPERS ─────────
 def normalize(text):
-    return (text or "").lower()
+    return text.lower()
 
 # ───────── ROUTES ─────────
 
@@ -31,8 +30,7 @@ def health():
 @app.route("/search", methods=["GET"])
 def search():
     query = request.args.get("q", "").strip()
-    page = int(request.args.get("page", 1))
-    per_page = int(request.args.get("per_page", 10))
+    limit = int(request.args.get("limit", 10))
 
     if not query:
         return jsonify({
@@ -41,14 +39,14 @@ def search():
         }), 400
 
     q = normalize(query)
-    matched = []
+    results = []
 
     for item in MOVIES:
-        title = normalize(item.get("title"))
-        fname = normalize(item.get("file_name"))
+        title = normalize(item.get("title", ""))
+        fname = normalize(item.get("file_name", ""))
 
         if q in title or q in fname:
-            matched.append({
+            results.append({
                 "uid": item["uid"],
                 "title": item.get("title"),
                 "size": item.get("size"),
@@ -56,26 +54,13 @@ def search():
                 "type": item.get("type")
             })
 
-    total_results = len(matched)
-    total_pages = max(1, math.ceil(total_results / per_page))
-
-    if page < 1:
-        page = 1
-    if page > total_pages:
-        page = total_pages
-
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_results = matched[start:end]
+        if len(results) >= limit:
+            break
 
     return jsonify({
         "success": True,
-        "query": query,
-        "page": page,
-        "per_page": per_page,
-        "total_results": total_results,
-        "total_pages": total_pages,
-        "results": page_results
+        "count": len(results),
+        "results": results
     })
 
 @app.route("/file", methods=["GET"])
