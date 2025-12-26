@@ -1,63 +1,66 @@
 import json
 import math
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Query, HTTPException
 
-app = Flask(__name__)
+app = FastAPI(
+    title="Paradox Movie API",
+    version="2.0",
+    docs_url=None,
+    redoc_url=None
+)
 
-# ───────────────── LOAD DATABASE ─────────────────
-with open("movie.json", "r", encoding="utf-8") as f:
-    MOVIES = json.load(f)
+MOVIES = []
+UID_INDEX = {}
+TOTAL_MOVIES = 0
 
-TOTAL_MOVIES = len(MOVIES)
 
-# UID → item lookup (fast O(1))
-UID_INDEX = {item["uid"]: item for item in MOVIES}
+# ───────────────── STARTUP ─────────────────
+@app.on_event("startup")
+def load_database():
+    global MOVIES, UID_INDEX, TOTAL_MOVIES
+
+    with open("movie.json", "r", encoding="utf-8") as f:
+        MOVIES = json.load(f)
+
+    UID_INDEX = {item["uid"]: item for item in MOVIES}
+    TOTAL_MOVIES = len(MOVIES)
+
+    print(f"✅ Loaded {TOTAL_MOVIES} movies into memory")
+
 
 # ───────────────── HELPERS ─────────────────
-def normalize(text):
+def normalize(text: str) -> str:
     return (text or "").lower()
+
 
 # ───────────────── ROUTES ─────────────────
 
-# 1️⃣ Health / Status
-@app.route("/", methods=["GET"])
+# 1️⃣ Health
+@app.get("/")
 def health():
-    return jsonify({
+    return {
         "success": True,
         "api": "Paradox Movie API",
         "status": "online",
         "total_movies": TOTAL_MOVIES
-    })
+    }
 
 
-# 2️⃣ Search Endpoint (Paginated)
-@app.route("/search", methods=["GET"])
-def search():
-    query = request.args.get("q", "").strip()
-    page = int(request.args.get("page", 1))
-    limit = int(request.args.get("limit", 10))
-
-    # Safety limits
-    if limit < 1:
-        limit = 10
-    if limit > 20:
-        limit = 20
-
-    if not query:
-        return jsonify({
-            "success": False,
-            "message": "Query parameter 'q' is required"
-        }), 400
-
-    q = normalize(query)
+# 2️⃣ Search (Paginated)
+@app.get("/search")
+def search(
+    q: str = Query(..., min_length=1),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=20)
+):
+    query = normalize(q)
     matched = []
 
-    # Full DB scan (safe for ~20k items)
     for item in MOVIES:
         title = normalize(item.get("title"))
         fname = normalize(item.get("file_name"))
 
-        if q in title or q in fname:
+        if query in title or query in fname:
             matched.append({
                 "uid": item["uid"],
                 "title": item.get("title"),
@@ -69,50 +72,35 @@ def search():
     total_results = len(matched)
     total_pages = max(1, math.ceil(total_results / limit))
 
-    # Clamp page
-    if page < 1:
-        page = 1
     if page > total_pages:
         page = total_pages
 
     start = (page - 1) * limit
     end = start + limit
-    page_results = matched[start:end]
 
-    return jsonify({
+    return {
         "success": True,
-        "query": query,
+        "query": q,
         "page": page,
         "limit": limit,
         "total_results": total_results,
         "total_pages": total_pages,
-        "results": page_results
-    })
+        "results": matched[start:end]
+    }
 
 
-# 3️⃣ UID → File Resolver
-@app.route("/file", methods=["GET"])
-def file_lookup():
-    uid = request.args.get("uid", "").strip()
-
-    if not uid:
-        return jsonify({
-            "success": False,
-            "message": "UID is required"
-        }), 400
-
+# 3️⃣ UID → File Resolver (ULTRA FAST)
+@app.get("/file")
+def resolve(uid: str = Query(..., min_length=1)):
     item = UID_INDEX.get(uid)
 
     if not item:
-        return jsonify({
-            "success": False,
-            "message": "Invalid UID"
-        }), 404
+        raise HTTPException(status_code=404, detail="Invalid UID")
 
-    return jsonify({
+    return {
         "success": True,
         "uid": uid,
         "post_id": item["post_id"],
         "channel_id": item["channel_id"],
         "title": item.get("title")
-    })
+    }
