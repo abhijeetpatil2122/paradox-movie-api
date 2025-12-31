@@ -1,12 +1,20 @@
 import sqlite3
 import math
+import os
+import requests
 from fastapi import FastAPI, Query, HTTPException
 
-DB_PATH = "movies.db"
+# ───────────────── CONFIG ─────────────────
+
+BLOB_DB_URL = os.getenv("MOVIES_DB_URL")
+LOCAL_DB_PATH = "/tmp/movies.db"
+
+if not BLOB_DB_URL:
+    raise RuntimeError("MOVIES_DB_URL environment variable is not set")
 
 app = FastAPI(
     title="Paradox Movie API",
-    version="3.0",
+    version="3.1",
     docs_url=None,
     redoc_url=None
 )
@@ -14,38 +22,41 @@ app = FastAPI(
 # ───────────────── DB HELPERS ─────────────────
 
 def get_db():
-    # check_same_thread=False is IMPORTANT for FastAPI
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    return sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
 
 
-def row_to_dict(row):
-    return {
-        "uid": row[0],
-        "post_id": row[1],
-        "channel_id": row[2],
-        "title": row[3],
-        "file_name": row[4],
-        "duration": row[5],
-        "size": row[6],
-        "mime": row[7],
-        "type": row[8]
-    }
+def download_db_once():
+    if os.path.exists(LOCAL_DB_PATH):
+        print("📦 SQLite DB already exists, skipping download")
+        return
+
+    print("⬇️ Downloading SQLite DB from Blob...")
+    r = requests.get(BLOB_DB_URL, timeout=60)
+    r.raise_for_status()
+
+    with open(LOCAL_DB_PATH, "wb") as f:
+        f.write(r.content)
+
+    print(f"✅ DB downloaded to {LOCAL_DB_PATH}")
 
 
 # ───────────────── STARTUP ─────────────────
 
 @app.on_event("startup")
 def startup():
-    # Simple DB sanity check
     try:
+        download_db_once()
+
         conn = get_db()
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM movies")
         total = cur.fetchone()[0]
         conn.close()
-        print(f"✅ SQLite DB loaded: {total} records")
+
+        print(f"🚀 SQLite DB ready: {total} records")
+
     except Exception as e:
-        print("❌ Database error:", e)
+        print("❌ Startup failure:", e)
         raise e
 
 
@@ -81,7 +92,7 @@ def search(
     conn = get_db()
     cur = conn.cursor()
 
-    # Count total matches
+    # total matches
     cur.execute(
         """
         SELECT COUNT(*)
@@ -99,11 +110,10 @@ def search(
         page = total_pages
         offset = (page - 1) * limit
 
-    # Fetch page results
+    # page results
     cur.execute(
         """
-        SELECT uid, post_id, channel_id, title, file_name,
-               duration, size, mime, type
+        SELECT uid, title, duration, size, type
         FROM movies
         WHERE lower(title) LIKE ?
            OR lower(file_name) LIKE ?
@@ -116,17 +126,6 @@ def search(
     rows = cur.fetchall()
     conn.close()
 
-    results = [
-        {
-            "uid": r[0],
-            "title": r[3],
-            "size": r[6],
-            "duration": r[5],
-            "type": r[8]
-        }
-        for r in rows
-    ]
-
     return {
         "success": True,
         "query": q,
@@ -134,7 +133,16 @@ def search(
         "limit": limit,
         "total_results": total_results,
         "total_pages": total_pages,
-        "results": results
+        "results": [
+            {
+                "uid": r[0],
+                "title": r[1],
+                "duration": r[2],
+                "size": r[3],
+                "type": r[4]
+            }
+            for r in rows
+        ]
     }
 
 
