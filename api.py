@@ -1,7 +1,6 @@
 import sqlite3
 import math
 import os
-import re
 import requests
 from fastapi import FastAPI, Query, HTTPException
 
@@ -15,20 +14,16 @@ if not BLOB_DB_URL:
 
 app = FastAPI(
     title="Paradox Movie API",
-    version="3.2",
+    version="4.0",
     docs_url=None,
     redoc_url=None
 )
 
 # ───────────────── DB HELPERS ─────────────────
 
-def get_db():
-    return sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
-
-
 def download_db_once():
     if os.path.exists(LOCAL_DB_PATH):
-        print("📦 SQLite DB already exists, skipping download")
+        print("📦 DB already exists, skipping download")
         return
 
     print("⬇️ Downloading SQLite DB from Blob...")
@@ -38,77 +33,42 @@ def download_db_once():
     with open(LOCAL_DB_PATH, "wb") as f:
         f.write(r.content)
 
-    print("✅ DB downloaded successfully")
+    print("✅ DB downloaded")
 
 
-# ───────────────── SEARCH HELPERS ─────────────────
-
-def normalize(text: str) -> str:
-    if not text:
-        return ""
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def get_db():
+    return sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
 
 
-def extract_year(text: str):
-    m = re.search(r"\b(19|20)\d{2}\b", text)
-    return m.group(0) if m else None
-
-
-def score_item(query_words, query_year, text):
-    score = 0
-
-    # Name match (MOST IMPORTANT)
-    for w in query_words:
-        if w.isdigit():
-            continue
-        if w in text:
-            score += 50
-
-    # Optional year boost
-    if query_year:
-        if query_year in text:
-            score += 25
-        else:
-            score -= 10
-
-    # Quality boosts
-    if "1080p" in text:
-        score += 10
-    elif "720p" in text:
-        score += 5
-    elif "480p" in text:
-        score += 2
-
-    # Language boosts
-    if "hindi" in text:
-        score += 5
-    if "english" in text:
-        score += 3
-
-    return score
+def sanitize_query(q: str) -> str:
+    """
+    Prepare query for FTS5:
+    - lowercase
+    - remove dangerous chars
+    - tokenize for intent-based search
+    """
+    q = q.lower().strip()
+    q = q.replace("'", " ")
+    q = q.replace('"', " ")
+    tokens = [t for t in q.split() if len(t) > 1]
+    return " ".join(tokens)
 
 
 # ───────────────── STARTUP ─────────────────
 
 @app.on_event("startup")
 def startup():
-    try:
-        download_db_once()
+    download_db_once()
 
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM movies")
-        total = cur.fetchone()[0]
-        conn.close()
+    conn = get_db()
+    cur = conn.cursor()
 
-        print(f"🚀 SQLite DB ready: {total} records")
+    # sanity check
+    cur.execute("SELECT COUNT(*) FROM movies")
+    total = cur.fetchone()[0]
 
-    except Exception as e:
-        print("❌ Startup failure:", e)
-        raise e
+    conn.close()
+    print(f"🚀 SQLite DB ready: {total} records")
 
 
 # ───────────────── ROUTES ─────────────────
@@ -130,59 +90,71 @@ def health():
     }
 
 
-# 2️⃣ SMART SEARCH (Ranked + Paginated)
+# 2️⃣ SEARCH — FTS5 (FAST + RANKED + CORRECT)
 @app.get("/search")
 def search(
     q: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=20)
 ):
-    q_norm = normalize(q)
-    query_words = q_norm.split()
-    query_year = extract_year(q_norm)
+    query = sanitize_query(q)
+
+    if not query:
+        raise HTTPException(status_code=400, detail="Invalid search query")
+
+    offset = (page - 1) * limit
 
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT uid, title, file_name, duration, size, type
-        FROM movies
-        WHERE title IS NOT NULL OR file_name IS NOT NULL
-    """)
+    # Count matches (FTS5)
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM movies_fts
+        WHERE movies_fts MATCH ?
+        """,
+        (query,)
+    )
+    total_results = cur.fetchone()[0]
 
-    scored = []
+    if total_results == 0:
+        conn.close()
+        return {
+            "success": True,
+            "query": q,
+            "page": 1,
+            "limit": limit,
+            "total_results": 0,
+            "total_pages": 0,
+            "results": []
+        }
 
-    for uid, title, fname, duration, size, mtype in cur.fetchall():
-        combined = normalize((title or "") + " " + (fname or ""))
-        score = score_item(query_words, query_year, combined)
-
-        if score > 0:
-            scored.append({
-                "uid": uid,
-                "title": title or fname,
-                "duration": duration,
-                "size": size,
-                "type": mtype,
-                "_score": score
-            })
-
-    conn.close()
-
-    scored.sort(key=lambda x: x["_score"], reverse=True)
-
-    total_results = len(scored)
-    total_pages = max(1, math.ceil(total_results / limit))
+    total_pages = math.ceil(total_results / limit)
 
     if page > total_pages:
         page = total_pages
+        offset = (page - 1) * limit
 
-    start = (page - 1) * limit
-    end = start + limit
-    page_results = scored[start:end]
+    # Fetch ranked results
+    cur.execute(
+        """
+        SELECT m.uid,
+               m.title,
+               m.duration,
+               m.size,
+               m.type
+        FROM movies_fts f
+        JOIN movies m ON m.rowid = f.rowid
+        WHERE f MATCH ?
+        ORDER BY bm25(f) ASC
+        LIMIT ? OFFSET ?
+        """,
+        (query, limit, offset)
+    )
 
-    # Remove internal score
-    for r in page_results:
-        r.pop("_score", None)
+    rows = cur.fetchall()
+    conn.close()
 
     return {
         "success": True,
@@ -191,11 +163,20 @@ def search(
         "limit": limit,
         "total_results": total_results,
         "total_pages": total_pages,
-        "results": page_results
+        "results": [
+            {
+                "uid": r[0],
+                "title": r[1],
+                "duration": r[2],
+                "size": r[3],
+                "type": r[4]
+            }
+            for r in rows
+        ]
     }
 
 
-# 3️⃣ UID → File Resolver (ULTRA FAST)
+# 3️⃣ UID → FILE RESOLVER (ULTRA FAST)
 @app.get("/file")
 def resolve(uid: str = Query(..., min_length=1)):
     conn = get_db()
