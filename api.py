@@ -14,7 +14,7 @@ if not BLOB_DB_URL:
 
 app = FastAPI(
     title="Paradox Movie API",
-    version="4.0",
+    version="2.0",
     docs_url=None,
     redoc_url=None
 )
@@ -40,20 +40,6 @@ def get_db():
     return sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
 
 
-def sanitize_query(q: str) -> str:
-    """
-    Prepare query for FTS5:
-    - lowercase
-    - remove dangerous chars
-    - tokenize for intent-based search
-    """
-    q = q.lower().strip()
-    q = q.replace("'", " ")
-    q = q.replace('"', " ")
-    tokens = [t for t in q.split() if len(t) > 1]
-    return " ".join(tokens)
-
-
 # ───────────────── STARTUP ─────────────────
 
 @app.on_event("startup")
@@ -62,12 +48,10 @@ def startup():
 
     conn = get_db()
     cur = conn.cursor()
-
-    # sanity check
     cur.execute("SELECT COUNT(*) FROM movies")
     total = cur.fetchone()[0]
-
     conn.close()
+
     print(f"🚀 SQLite DB ready: {total} records")
 
 
@@ -90,31 +74,60 @@ def health():
     }
 
 
-# 2️⃣ SEARCH — FTS5 (FAST + RANKED + CORRECT)
+# 2️⃣ STRICT MOVIE SEARCH (NO SPAM RESULTS)
 @app.get("/search")
 def search(
     q: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=20)
 ):
-    query = sanitize_query(q)
-
-    if not query:
-        raise HTTPException(status_code=400, detail="Invalid search query")
+    tokens = [t.lower().strip() for t in q.split() if len(t) > 1]
+    if not tokens:
+        raise HTTPException(status_code=400, detail="Invalid query")
 
     offset = (page - 1) * limit
 
     conn = get_db()
     cur = conn.cursor()
 
-    # Count matches (FTS5)
+    # Build strict token conditions (ALL tokens must match)
+    conditions = []
+    params = []
+
+    for t in tokens:
+        conditions.append("""
+        (
+            lower(title) = ?
+            OR lower(title) LIKE ?
+            OR lower(title) LIKE ?
+            OR lower(title) LIKE ?
+            OR lower(file_name) = ?
+            OR lower(file_name) LIKE ?
+            OR lower(file_name) LIKE ?
+            OR lower(file_name) LIKE ?
+        )
+        """)
+        params.extend([
+            t,
+            f"{t} %",
+            f"% {t} %",
+            f"% {t}",
+            t,
+            f"{t} %",
+            f"% {t} %",
+            f"% {t}",
+        ])
+
+    where_clause = " AND ".join(conditions)
+
+    # Count matches
     cur.execute(
-        """
+        f"""
         SELECT COUNT(*)
-        FROM movies_fts
-        WHERE movies_fts MATCH ?
+        FROM movies
+        WHERE {where_clause}
         """,
-        (query,)
+        params
     )
     total_results = cur.fetchone()[0]
 
@@ -131,26 +144,26 @@ def search(
         }
 
     total_pages = math.ceil(total_results / limit)
-
     if page > total_pages:
         page = total_pages
         offset = (page - 1) * limit
 
-    # Fetch ranked results
+    # Fetch results (rank exact title matches higher)
     cur.execute(
-        """
-        SELECT m.uid,
-               m.title,
-               m.duration,
-               m.size,
-               m.type
-        FROM movies_fts f
-        JOIN movies m ON m.rowid = f.rowid
-        WHERE f MATCH ?
-        ORDER BY bm25(f) ASC
+        f"""
+        SELECT uid, title, duration, size, type
+        FROM movies
+        WHERE {where_clause}
+        ORDER BY
+            CASE
+                WHEN lower(title) = ? THEN 0
+                WHEN lower(title) LIKE ? THEN 1
+                ELSE 2
+            END,
+            post_id DESC
         LIMIT ? OFFSET ?
         """,
-        (query, limit, offset)
+        params + [tokens[0], f"{tokens[0]} %", limit, offset]
     )
 
     rows = cur.fetchall()
@@ -176,7 +189,7 @@ def search(
     }
 
 
-# 3️⃣ UID → FILE RESOLVER (ULTRA FAST)
+# 3️⃣ UID → FILE RESOLVER (FAST & SAFE)
 @app.get("/file")
 def resolve(uid: str = Query(..., min_length=1)):
     conn = get_db()
