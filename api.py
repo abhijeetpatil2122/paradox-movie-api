@@ -1,6 +1,7 @@
 import sqlite3
 import math
 import os
+import re
 import requests
 from fastapi import FastAPI, Query, HTTPException
 
@@ -14,7 +15,7 @@ if not BLOB_DB_URL:
 
 app = FastAPI(
     title="Paradox Movie API",
-    version="3.1",
+    version="3.2",
     docs_url=None,
     redoc_url=None
 )
@@ -31,13 +32,63 @@ def download_db_once():
         return
 
     print("⬇️ Downloading SQLite DB from Blob...")
-    r = requests.get(BLOB_DB_URL, timeout=60)
+    r = requests.get(BLOB_DB_URL, timeout=120)
     r.raise_for_status()
 
     with open(LOCAL_DB_PATH, "wb") as f:
         f.write(r.content)
 
-    print(f"✅ DB downloaded to {LOCAL_DB_PATH}")
+    print("✅ DB downloaded successfully")
+
+
+# ───────────────── SEARCH HELPERS ─────────────────
+
+def normalize(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def extract_year(text: str):
+    m = re.search(r"\b(19|20)\d{2}\b", text)
+    return m.group(0) if m else None
+
+
+def score_item(query_words, query_year, text):
+    score = 0
+
+    # Name match (MOST IMPORTANT)
+    for w in query_words:
+        if w.isdigit():
+            continue
+        if w in text:
+            score += 50
+
+    # Optional year boost
+    if query_year:
+        if query_year in text:
+            score += 25
+        else:
+            score -= 10
+
+    # Quality boosts
+    if "1080p" in text:
+        score += 10
+    elif "720p" in text:
+        score += 5
+    elif "480p" in text:
+        score += 2
+
+    # Language boosts
+    if "hindi" in text:
+        score += 5
+    if "english" in text:
+        score += 3
+
+    return score
 
 
 # ───────────────── STARTUP ─────────────────
@@ -79,52 +130,59 @@ def health():
     }
 
 
-# 2️⃣ Search (Indexed, Paginated)
+# 2️⃣ SMART SEARCH (Ranked + Paginated)
 @app.get("/search")
 def search(
     q: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=20)
 ):
-    query = f"%{q.lower()}%"
-    offset = (page - 1) * limit
+    q_norm = normalize(q)
+    query_words = q_norm.split()
+    query_year = extract_year(q_norm)
 
     conn = get_db()
     cur = conn.cursor()
 
-    # total matches
-    cur.execute(
-        """
-        SELECT COUNT(*)
+    cur.execute("""
+        SELECT uid, title, file_name, duration, size, type
         FROM movies
-        WHERE lower(title) LIKE ?
-           OR lower(file_name) LIKE ?
-        """,
-        (query, query)
-    )
-    total_results = cur.fetchone()[0]
+        WHERE title IS NOT NULL OR file_name IS NOT NULL
+    """)
 
+    scored = []
+
+    for uid, title, fname, duration, size, mtype in cur.fetchall():
+        combined = normalize((title or "") + " " + (fname or ""))
+        score = score_item(query_words, query_year, combined)
+
+        if score > 0:
+            scored.append({
+                "uid": uid,
+                "title": title or fname,
+                "duration": duration,
+                "size": size,
+                "type": mtype,
+                "_score": score
+            })
+
+    conn.close()
+
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+
+    total_results = len(scored)
     total_pages = max(1, math.ceil(total_results / limit))
 
     if page > total_pages:
         page = total_pages
-        offset = (page - 1) * limit
 
-    # page results
-    cur.execute(
-        """
-        SELECT uid, title, duration, size, type
-        FROM movies
-        WHERE lower(title) LIKE ?
-           OR lower(file_name) LIKE ?
-        ORDER BY post_id DESC
-        LIMIT ? OFFSET ?
-        """,
-        (query, query, limit, offset)
-    )
+    start = (page - 1) * limit
+    end = start + limit
+    page_results = scored[start:end]
 
-    rows = cur.fetchall()
-    conn.close()
+    # Remove internal score
+    for r in page_results:
+        r.pop("_score", None)
 
     return {
         "success": True,
@@ -133,16 +191,7 @@ def search(
         "limit": limit,
         "total_results": total_results,
         "total_pages": total_pages,
-        "results": [
-            {
-                "uid": r[0],
-                "title": r[1],
-                "duration": r[2],
-                "size": r[3],
-                "type": r[4]
-            }
-            for r in rows
-        ]
+        "results": page_results
     }
 
 
