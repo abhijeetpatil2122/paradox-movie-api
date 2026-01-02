@@ -57,7 +57,7 @@ def startup():
 
 # ───────────────── ROUTES ─────────────────
 
-# 1️⃣ BASE / HEALTH (MINIMAL INFO ONLY)
+# 1️⃣ BASE / HEALTH (MINIMAL)
 @app.get("/")
 def health():
     return {
@@ -66,7 +66,7 @@ def health():
         "status": "online"
     }
 
-# 2️⃣ STATS (ADMIN / PUBLIC SAFE)
+# 2️⃣ STATS
 @app.get("/stats")
 def stats():
     conn = get_db()
@@ -98,14 +98,14 @@ def stats():
         }
     }
 
-# 3️⃣ STRICT MOVIE SEARCH (ANTI-SPAM)
+# 3️⃣ FIXED SEARCH (CAPTION FIRST, FILE NAME FALLBACK)
 @app.get("/search")
 def search(
     q: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=20)
 ):
-    tokens = [t.lower().strip() for t in q.split() if len(t) > 1]
+    tokens = [t.lower() for t in q.split() if len(t) > 1]
     if not tokens:
         raise HTTPException(status_code=400, detail="Invalid query")
 
@@ -117,8 +117,9 @@ def search(
     for t in tokens:
         conditions.append("""
         (
-            lower(title) LIKE ?
-            OR lower(file_name) LIKE ?
+            (title IS NOT NULL AND title != '' AND lower(title) LIKE ?)
+            OR
+            ((title IS NULL OR title = '') AND lower(file_name) LIKE ?)
         )
         """)
         params.extend([f"%{t}%", f"%{t}%"])
@@ -128,6 +129,7 @@ def search(
     conn = get_db()
     cur = conn.cursor()
 
+    # Count results
     cur.execute(
         f"SELECT COUNT(*) FROM movies WHERE {where_clause}",
         params
@@ -151,12 +153,18 @@ def search(
         page = total_pages
         offset = (page - 1) * limit
 
+    # Fetch results (caption-ranked first)
     cur.execute(
         f"""
         SELECT uid, title, duration, size, type
         FROM movies
         WHERE {where_clause}
-        ORDER BY post_id DESC
+        ORDER BY
+            CASE
+                WHEN title IS NOT NULL AND title != '' THEN 0
+                ELSE 1
+            END,
+            post_id DESC
         LIMIT ? OFFSET ?
         """,
         params + [limit, offset]
@@ -184,7 +192,7 @@ def search(
         ]
     }
 
-# 4️⃣ UID → FILE RESOLVER (FAST & SAFE)
+# 4️⃣ UID → FILE RESOLVER
 @app.get("/file")
 def resolve(uid: str = Query(..., min_length=1)):
     conn = get_db()
