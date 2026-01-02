@@ -2,9 +2,13 @@ import sqlite3
 import math
 import os
 import requests
+import time
 from fastapi import FastAPI, Query, HTTPException
 
 # ───────────────── CONFIG ─────────────────
+
+API_NAME = "Paradox Movie API | @Paradox0x0 | @ParadoxBackup"
+API_VERSION = "1.0"
 
 BLOB_DB_URL = os.getenv("MOVIES_DB_URL")
 LOCAL_DB_PATH = "/tmp/movies.db"
@@ -12,9 +16,11 @@ LOCAL_DB_PATH = "/tmp/movies.db"
 if not BLOB_DB_URL:
     raise RuntimeError("MOVIES_DB_URL environment variable is not set")
 
+APP_START_TIME = time.time()
+
 app = FastAPI(
     title="Paradox Movie API",
-    version="2.0",
+    version=API_VERSION,
     docs_url=None,
     redoc_url=None
 )
@@ -23,22 +29,17 @@ app = FastAPI(
 
 def download_db_once():
     if os.path.exists(LOCAL_DB_PATH):
-        print("📦 DB already exists, skipping download")
         return
 
-    print("⬇️ Downloading SQLite DB from Blob...")
     r = requests.get(BLOB_DB_URL, timeout=120)
     r.raise_for_status()
 
     with open(LOCAL_DB_PATH, "wb") as f:
         f.write(r.content)
 
-    print("✅ DB downloaded")
-
 
 def get_db():
     return sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
-
 
 # ───────────────── STARTUP ─────────────────
 
@@ -54,27 +55,50 @@ def startup():
 
     print(f"🚀 SQLite DB ready: {total} records")
 
-
 # ───────────────── ROUTES ─────────────────
 
-# 1️⃣ Health
+# 1️⃣ BASE / HEALTH (MINIMAL INFO ONLY)
 @app.get("/")
 def health():
+    return {
+        "success": True,
+        "api": API_NAME,
+        "status": "online"
+    }
+
+# 2️⃣ STATS (ADMIN / PUBLIC SAFE)
+@app.get("/stats")
+def stats():
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute("SELECT COUNT(*) FROM movies")
     total = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM movies WHERE type='video'")
+    videos = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM movies WHERE type='document'")
+    documents = cur.fetchone()[0]
+
     conn.close()
 
     return {
         "success": True,
-        "api": "Paradox Movie API",
-        "status": "online",
-        "total_movies": total
+        "api": API_NAME,
+        "version": API_VERSION,
+        "started_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(APP_START_TIME)
+        ),
+        "uptime_seconds": int(time.time() - APP_START_TIME),
+        "database": {
+            "total_items": total,
+            "videos": videos,
+            "documents": documents
+        }
     }
 
-
-# 2️⃣ STRICT MOVIE SEARCH (NO SPAM RESULTS)
+# 3️⃣ STRICT MOVIE SEARCH (ANTI-SPAM)
 @app.get("/search")
 def search(
     q: str = Query(..., min_length=1),
@@ -87,46 +111,25 @@ def search(
 
     offset = (page - 1) * limit
 
-    conn = get_db()
-    cur = conn.cursor()
-
-    # Build strict token conditions (ALL tokens must match)
     conditions = []
     params = []
 
     for t in tokens:
         conditions.append("""
         (
-            lower(title) = ?
-            OR lower(title) LIKE ?
-            OR lower(title) LIKE ?
-            OR lower(title) LIKE ?
-            OR lower(file_name) = ?
-            OR lower(file_name) LIKE ?
-            OR lower(file_name) LIKE ?
+            lower(title) LIKE ?
             OR lower(file_name) LIKE ?
         )
         """)
-        params.extend([
-            t,
-            f"{t} %",
-            f"% {t} %",
-            f"% {t}",
-            t,
-            f"{t} %",
-            f"% {t} %",
-            f"% {t}",
-        ])
+        params.extend([f"%{t}%", f"%{t}%"])
 
     where_clause = " AND ".join(conditions)
 
-    # Count matches
+    conn = get_db()
+    cur = conn.cursor()
+
     cur.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM movies
-        WHERE {where_clause}
-        """,
+        f"SELECT COUNT(*) FROM movies WHERE {where_clause}",
         params
     )
     total_results = cur.fetchone()[0]
@@ -148,22 +151,15 @@ def search(
         page = total_pages
         offset = (page - 1) * limit
 
-    # Fetch results (rank exact title matches higher)
     cur.execute(
         f"""
         SELECT uid, title, duration, size, type
         FROM movies
         WHERE {where_clause}
-        ORDER BY
-            CASE
-                WHEN lower(title) = ? THEN 0
-                WHEN lower(title) LIKE ? THEN 1
-                ELSE 2
-            END,
-            post_id DESC
+        ORDER BY post_id DESC
         LIMIT ? OFFSET ?
         """,
-        params + [tokens[0], f"{tokens[0]} %", limit, offset]
+        params + [limit, offset]
     )
 
     rows = cur.fetchall()
@@ -188,8 +184,7 @@ def search(
         ]
     }
 
-
-# 3️⃣ UID → FILE RESOLVER (FAST & SAFE)
+# 4️⃣ UID → FILE RESOLVER (FAST & SAFE)
 @app.get("/file")
 def resolve(uid: str = Query(..., min_length=1)):
     conn = get_db()
